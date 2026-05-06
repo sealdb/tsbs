@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +19,30 @@ const (
 	TimeValueIdx = "TIME-VALUE"
 	ValueTimeIdx = "VALUE-TIME"
 )
+
+// timescaleExtVersionSupportsReplicationFactor is true only for TimescaleDB
+// 2.13.x, where create_hypertable (old interface) still documents
+// replication_factor. The parameter was removed from 2.14 onward; see
+// https://www.tigerdata.com/docs/reference/timescaledb/hypertables/create_hypertable_old
+func timescaleExtVersionSupportsReplicationFactor(extVersion string) bool {
+	extVersion = strings.TrimSpace(extVersion)
+	if extVersion == "" {
+		return false
+	}
+	if i := strings.IndexByte(extVersion, '-'); i >= 0 {
+		extVersion = extVersion[:i]
+	}
+	parts := strings.Split(extVersion, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	major, err1 := strconv.Atoi(parts[0])
+	minor, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return major == 2 && minor == 13
+}
 
 // allows for testing
 var fatal = log.Fatalf
@@ -200,6 +225,18 @@ func (d *dbCreator) createTableAndIndexes(dbBench *sql.DB, tableName string, fie
 
 		MustExec(dbBench, "CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE")
 
+		versionRows := MustQuery(dbBench, "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb'")
+		defer versionRows.Close()
+
+		tsVersion := ""
+		if versionRows.Next() {
+			if err := versionRows.Scan(&tsVersion); err != nil {
+				panic(err)
+			}
+		}
+
+		supportsReplicationFactor := timescaleExtVersionSupportsReplicationFactor(tsVersion)
+
 		// Replication factor determines whether we create a distributed hypertable
 		// or not. If it is unset or zero, then we will create a regular
 		// hypertable with no partitions.
@@ -213,9 +250,14 @@ func (d *dbCreator) createTableAndIndexes(dbBench *sql.DB, tableName string, fie
 		// partitioning on regular hypertables
 		if d.opts.NumberPartitions > 0 {
 			partitionsOption = fmt.Sprintf("partitioning_column => '%s'::name, number_partitions => %v::smallint", partitionColumn, d.opts.NumberPartitions)
+		} else if !supportsReplicationFactor {
+			// TimescaleDB 2.14+ removed replication_factor from create_hypertable;
+			// omit it and set partitioning_column to NULL for a plain time-partitioned hypertable.
+			// See https://www.tigerdata.com/docs/reference/timescaledb/hypertables/create_hypertable_old
+			partitionsOption = "partitioning_column => NULL"
 		}
 
-		if d.opts.ReplicationFactor > 0 {
+		if supportsReplicationFactor && d.opts.ReplicationFactor > 0 {
 			// This gives us a future option of testing the impact of
 			// multi-node replication across data nodes
 			partitionsOption = fmt.Sprintf("partitioning_column => '%s'::name, replication_factor => %v::smallint", partitionColumn, d.opts.ReplicationFactor)
